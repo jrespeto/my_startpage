@@ -1,4 +1,3 @@
-````markdown
 # StartPage (single-file)
 
 A tiny, self-hosted **“start.me”-style** dashboard you run on `localhost`.
