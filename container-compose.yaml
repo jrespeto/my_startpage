@@ -1,0 +1,18 @@
+services:
+  startpage:
+    build:
+      context: .
+      dockerfile: Docker/containerfile
+    ports:
+      - "5000:5000"
+    environment:
+      # Change these in your env or here:
+      ADMIN_USER: "admin"
+      ADMIN_PASS: "password"
+      FLASK_SECRET: "change-this"
+      # Optional: number of gunicorn workers
+      WORKERS: "2"
+    volumes:
+      # Persist bookmarks.csv here
+      - ./data:/data:Z
+    restart: unless-stopped

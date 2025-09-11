@@ -1,0 +1,24 @@
+# Containerfile (aka Dockerfile)
+# Runs the app with Gunicorn, stores bookmarks.csv in /data
+
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    WORKERS=2
+
+# Install runtime deps
+RUN pip install --no-cache-dir Flask gunicorn
+
+WORKDIR /app
+
+# Copy app
+COPY src/my_startpage.py /app/my_startpage.py
+COPY src/start.sh /start.sh
+
+# Data dir for CSV
+RUN chmod +x /start.sh
+
+EXPOSE 5000
+CMD ["/start.sh"]
