@@ -35,6 +35,10 @@ Optional Docker/Compose setup is included.
 
 ---
 
+![alt text](image.png)
+
+---
+
 ## How to run it (System / Python)
 
 ### 1) Prerequisites
