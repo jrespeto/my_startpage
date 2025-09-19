@@ -1,13 +1,23 @@
 # my_startpage.py — single-file Flask "Start.me"-style dashboard
-# PAGES • Widgets • Bookmarks & Notes • Drag & Drop • Font Awesome • Dark Mode
-# Import bookmarks.html • CLI tools
+# Includes:
+# - Pages (6 columns), widgets (folders), bookmarks & notes
+# - Drag & drop (widgets & items), favicons, open-all
+# - Modal forms for add/edit; dark mode; collapse/expand all
+# - Import Chrome/Firefox bookmarks.html (folders → widgets)
+# - Dedupe (widgets by name per page; bookmarks by canonical URL per widget)
+# - Manage panel + search popover
+# - "Duplicate Bookmarks" viewer under Manage → Import / tools
+# - Keeps the "Duplicate Bookmarks" modal open while deleting entries (no full reload)
 #
-import csv, os, uuid, re, html, sys, argparse
-from urllib.parse import urlparse
+# Auth: simple session login (admin/password by default — override via env)
+# Storage: bookmarks.csv (no DB). CLI helpers included at bottom.
+
+import csv, os, re, html, sys, uuid
+from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
-from html.parser import HTMLParser
 from flask import Flask, request, redirect, url_for, session, flash, render_template_string, jsonify
 from markupsafe import Markup, escape
+from html.parser import HTMLParser
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", "dev-change-me")
@@ -23,54 +33,17 @@ FIELDS = ["rowtype","id","page_id","widget_id","column","order","name","url","no
 DEFAULT_PAGE_ID = "home"
 DEFAULT_PAGE_NAME = "My Start Page"
 
+
 # ----------------------------
 # Storage helpers
 # ----------------------------
 def ensure_csv():
-    """Create file with header if missing; migrate older schemas to include page_id/color."""
+    """Create file with header if missing."""
     if not os.path.exists(CSV_FILE):
         with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=FIELDS).writeheader()
         save_rows([dict(rowtype="page", id=DEFAULT_PAGE_ID, page_id="", widget_id="", column="", order="0",
                         name=DEFAULT_PAGE_NAME, url="", notes="", color="")])
-        return
-
-    with open(CSV_FILE, newline="", encoding="utf-8") as f:
-        rdr = csv.reader(f)
-        try:
-            header = next(rdr)
-        except StopIteration:
-            header = []
-
-    if header == FIELDS:
-        rows = load_rows()
-        if not any(r.get("rowtype") == "page" for r in rows):
-            rows.append(dict(rowtype="page", id=DEFAULT_PAGE_ID, page_id="", widget_id="", column="", order="0",
-                             name=DEFAULT_PAGE_NAME, url="", notes="", color=""))
-            save_rows(rows)
-        return
-
-    with open(CSV_FILE, newline="", encoding="utf-8") as f:
-        legacy = list(csv.DictReader(f, fieldnames=header)) if header else []
-    if legacy and header and legacy[0].get(header[0]) == header[0]:
-        legacy = legacy[1:]
-
-    new_rows = []
-    for r in legacy:
-        nr = {k: "" for k in FIELDS}
-        for k in r.keys():
-            if k in nr:
-                nr[k] = r.get(k, "")
-        if "page_id" not in header and r.get("rowtype") in ("widget","bookmark","note"):
-            nr["page_id"] = DEFAULT_PAGE_ID
-        if "color" not in header and r.get("rowtype") == "note":
-            nr["color"] = ""
-        new_rows.append(nr)
-
-    if not any(x.get("rowtype") == "page" for x in new_rows):
-        new_rows.append(dict(rowtype="page", id=DEFAULT_PAGE_ID, page_id="", widget_id="", column="", order="0",
-                             name=DEFAULT_PAGE_NAME, url="", notes="", color=""))
-    save_rows(new_rows)
 
 def load_rows():
     with open(CSV_FILE, newline="", encoding="utf-8") as f:
@@ -108,6 +81,7 @@ def find_row(rows, rid):
         if r.get("id") == rid:
             return r
     return None
+
 
 # ----------------------------
 # Pages / Widgets builders
@@ -174,6 +148,7 @@ def get_page_name(rows, pid):
             return r.get("name") or DEFAULT_PAGE_NAME
     return DEFAULT_PAGE_NAME
 
+
 # ----------------------------
 # Auth
 # ----------------------------
@@ -186,8 +161,9 @@ def login_required(fn):
         return fn(*a, **kw)
     return wrapper
 
+
 # ----------------------------
-# Utilities: favicons + titles + highlight
+# Utilities: favicons + titles + highlight + URL canon
 # ----------------------------
 @app.template_filter("favicon")
 def favicon_filter(url, size=16):
@@ -209,6 +185,24 @@ def normalize_url(u: str) -> str:
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", u):
         u = "https://" + u
     return u
+
+def canonical_url(u: str) -> str:
+    """Normalize URL for dedupe comparisons."""
+    u = normalize_url(u)
+    try:
+        pr = urlparse(u)
+        scheme = pr.scheme.lower() or "https"
+        netloc = pr.netloc.lower()
+        # strip default ports
+        if netloc.endswith(":80") and scheme=="http": netloc = netloc[:-3]
+        if netloc.endswith(":443") and scheme=="https": netloc = netloc[:-4]
+        path = (pr.path or "/")
+        if len(path) > 1:
+            path = path.rstrip("/")
+        # keep query; drop fragment
+        return urlunparse((scheme, netloc, path, "", pr.query, ""))
+    except Exception:
+        return u.strip().lower()
 
 def guess_title_from_url(u: str) -> str:
     try:
@@ -267,6 +261,7 @@ def jinja_hilite(text, q):
     out.append(escape(s[last:]))
     return Markup("").join(out)
 
+
 # ----------------------------
 # Netscape bookmarks.html parser
 # ----------------------------
@@ -324,15 +319,13 @@ class NetscapeBookmarksParser(HTMLParser):
             self.in_title = False
 
     def handle_data(self, data):
-        if self.in_h3:
-            self.h3_text.append(data)
-        if self.in_a:
-            self.a_text.append(data)
-        if self.in_title:
-            self.page_title += data
+        if self.in_h3: self.h3_text.append(data)
+        if self.in_a:  self.a_text.append(data)
+        if self.in_title: self.page_title += data
 
     def current_widget(self):
         return self.stack[-1][1] if self.stack else None
+
 
 # ----------------------------
 # Importer (shared by web + CLI)
@@ -349,8 +342,7 @@ def import_bookmarks_html(file_bytes: bytes, rows: list, page_id: str|None, new_
         try:
             head = file_bytes[:8192].decode("utf-8", errors="ignore")
             m = re.search(r"<title[^>]*>(.*?)</title>", head, flags=re.I|re.S)
-            if m:
-                title_from_file = html.unescape(m.group(1)).strip()
+            if m: title_from_file = html.unescape(m.group(1)).strip()
         except Exception:
             pass
         np_name = (new_page_name or title_from_file or "Imported").strip()
@@ -363,8 +355,7 @@ def import_bookmarks_html(file_bytes: bytes, rows: list, page_id: str|None, new_
 
     def make_widget(name: str):
         nonlocal col, created_widgets
-        if not name.strip():
-            name = "Unnamed"
+        if not name.strip(): name = "Unnamed"
         wid = new_id()
         rows.append(dict(rowtype="widget", id=wid, page_id=pid_used, widget_id="", column=str(col),
                          order=str(next_widget_order(rows, pid_used, col)), name=name.strip(), url="", notes="", color=""))
@@ -380,8 +371,7 @@ def import_bookmarks_html(file_bytes: bytes, rows: list, page_id: str|None, new_
     def on_link(href, title, depth):
         nonlocal created_bookmarks, fallback_widget_id
         href = normalize_url(href or "")
-        if not href:
-            return
+        if not href: return
         title = title.strip() or guess_title_from_url(href)
         wid = parser.current_widget()
         if not wid:
@@ -405,6 +395,126 @@ def import_bookmarks_html(file_bytes: bytes, rows: list, page_id: str|None, new_
 
     return created_pages, created_widgets, created_bookmarks, pid_used, (parser.page_title or title_from_file)
 
+
+# ----------------------------
+# DEDUPE LOGIC
+# ----------------------------
+def dedupe_widgets(rows):
+    """
+    Merge widgets with identical (page_id, name.lower().strip()).
+    Returns removed_count and a mapping {old_wid: primary_wid}.
+    """
+    key2primary = {}
+    old2new = {}
+    removed = 0
+
+    widgets = [r for r in rows if r.get("rowtype")=="widget"]
+    widgets.sort(key=lambda r: (r.get("page_id",""), int(r.get("column") or 1), int(r.get("order") or 0)))
+
+    for w in widgets:
+        key = (w.get("page_id",""), (w.get("name","") or "").strip().lower())
+        if key not in key2primary:
+            key2primary[key] = w["id"]
+        else:
+            primary = key2primary[key]
+            if w["id"] == primary:
+                continue
+            old2new[w["id"]] = primary
+            removed += 1
+
+    if not old2new:
+        return 0, {}
+
+    # Move items to primary widget
+    for r in rows:
+        if r.get("rowtype") in ("bookmark","note"):
+            wid = r.get("widget_id")
+            if wid in old2new:
+                new_wid = old2new[wid]
+                r["widget_id"] = new_wid
+                r["order"] = str(next_item_order(rows, new_wid))
+
+    rows[:] = [r for r in rows if not (r.get("rowtype")=="widget" and r.get("id") in old2new)]
+    return removed, old2new
+
+def dedupe_bookmarks(rows):
+    """
+    Within each widget, remove duplicate bookmarks by canonical URL.
+    Keep the first; if it has empty name and duplicate has one, copy title.
+    """
+    removed = 0
+    by_wid = {}
+    for r in rows:
+        if r.get("rowtype")=="bookmark":
+            by_wid.setdefault(r.get("widget_id",""), []).append(r)
+
+    for wid, blist in by_wid.items():
+        try:
+            blist.sort(key=lambda r: int(r.get("order") or 0))
+        except Exception:
+            pass
+        seen = {}
+        for b in blist:
+            cu = canonical_url(b.get("url",""))
+            if not cu:
+                cu = b.get("url","").strip().lower()
+            if cu not in seen:
+                seen[cu] = b
+            else:
+                primary = seen[cu]
+                if not (primary.get("name") or "").strip() and (b.get("name") or "").strip():
+                    primary["name"] = b.get("name","")
+                b["_delete"] = True
+
+    before = len(rows)
+    rows[:] = [r for r in rows if not r.get("_delete")]
+    removed += (before - len(rows))
+    return removed
+
+def run_dedupe(rows):
+    wr, _map = dedupe_widgets(rows)
+    br = dedupe_bookmarks(rows)
+    return wr, br
+
+
+# ----------------------------
+# Duplicate Bookmarks viewer
+# ----------------------------
+def list_duplicate_bookmarks(rows, page_id: str):
+    """Return a list of duplicates on a page: [{key, display, entries:[{id, wid, widget, name, url}...]}...]"""
+    widget_name = {r["id"]: r.get("name","") for r in rows if r.get("rowtype")=="widget" and r.get("page_id")==page_id}
+    buckets = {}
+    for r in rows:
+        if r.get("rowtype")!="bookmark":
+            continue
+        wid = r.get("widget_id")
+        if wid not in widget_name:
+            continue
+        cu = canonical_url(r.get("url",""))
+        if not cu:
+            cu = (r.get("url","") or "").strip().lower()
+        if not cu:
+            continue
+        entry = {
+            "id": r["id"],
+            "wid": wid,
+            "widget": widget_name[wid],
+            "name": r.get("name","") or r.get("url",""),
+            "url": r.get("url",""),
+        }
+        buckets.setdefault(cu, []).append(entry)
+
+    out = []
+    for key, entries in buckets.items():
+        if len(entries) < 2:
+            continue
+        display = next((e["name"] for e in entries if (e["name"] or "").strip()), "") or key
+        entries.sort(key=lambda e: (e["widget"].lower(), e["name"].lower()))
+        out.append({"key": key, "display": display, "entries": entries})
+    out.sort(key=lambda g: g["display"].lower())
+    return out
+
+
 # ----------------------------
 # Templates
 # ----------------------------
@@ -417,36 +527,12 @@ BASE = r"""
   <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
   <style>
     :root{
-      --gap: 0.7rem;
-      --radius: 6px;
-      --btn-radius: 6px;
-      --muted:#6b7280;
-      --brand:#2b6cb0;
-      --danger:#ef4444;
-      --bg:#f5f7fb;
-      --text:#0f172a;
-      --card-bg:#ffffff;
-      --header-bg:#253858;
-      --border:#e5e7eb;
-      --hover:#f3f4f6;
-      --link-size: 0.92rem;
-      --overlay: rgba(15, 23, 42, .55);
-      --hl:#fde68a;
+      --gap: 0.7rem; --radius: 6px; --btn-radius: 6px; --muted:#6b7280; --brand:#2b6cb0; --danger:#ef4444;
+      --bg:#f5f7fb; --text:#0f172a; --card-bg:#ffffff; --header-bg:#253858; --border:#e5e7eb; --hover:#f3f4f6;
+      --link-size: 0.92rem; --overlay: rgba(15, 23, 42, .55); --hl:#fde68a;
     }
-    .dark{
-      --bg:#0b1220;
-      --text:#e5e7eb;
-      --card-bg:#0f172a;
-      --header-bg:#0e223c;
-      --border:#1f2937;
-      --hover:#142036;
-      --brand:#7aa2ff;
-      --muted:#94a3b8;
-      --overlay: rgba(0, 0, 0, .6);
-      --hl:#8b6f00;
-    }
-    *{ box-sizing: border-box; }
-    html, body { height: 100%; }
+    .dark{ --bg:#0b1220; --text:#e5e7eb; --card-bg:#0f172a; --header-bg:#0e223c; --border:#1f2937; --hover:#142036; --brand:#7aa2ff; --muted:#94a3b8; --overlay: rgba(0,0,0,.6); --hl:#8b6f00; }
+    *{ box-sizing: border-box; } html, body { height: 100%; }
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background:var(--bg); color:var(--text); margin:0; }
     header { background:var(--header-bg); color:#fff; padding:0.6rem 1rem; display:flex; justify-content:space-between; align-items:center; gap:1rem; position:relative; z-index:5; }
     header a { color:#fff; text-decoration:none; font-weight:600; }
@@ -455,12 +541,8 @@ BASE = r"""
     .dark .page-select { background:#0f172a; color:#e5e7eb; border:1px solid var(--border); }
     .container { padding:0.8rem; max-width: min(2400px, 98vw); margin: 0 auto; }
     .flash { padding:0.45rem 0.7rem; border-radius:var(--radius); margin: 0 0 0.6rem 0; }
-    .flash.success { background:#e8fff2; color:#155d2e; }
-    .flash.info { background:#eef2ff; color:#1e3a8a; }
-    .flash.danger { background:#fff1f2; color:#991b1b; }
-    .dark .flash.success { background:#0f2a1b; color:#86efac; }
-    .dark .flash.info { background:#0f1530; color:#93c5fd; }
-    .dark .flash.danger { background:#2a0f14; color:#fda4af; }
+    .flash.success { background:#e8fff2; color:#155d2e; } .flash.info { background:#eef2ff; color:#1e3a8a; } .flash.danger { background:#fff1f2; color:#991b1b; }
+    .dark .flash.success { background:#0f2a1b; color:#86efac; } .dark .flash.info { background:#0f1530; color:#93c5fd; } .dark .flash.danger { background:#2a0f14; color:#fda4af; }
 
     .grid { display:grid; gap: var(--gap); grid-template-columns: repeat(6, minmax(0, 1fr)); }
     .col { min-width: 0; display:flex; flex-direction:column; gap: var(--gap); }
@@ -501,7 +583,7 @@ BASE = r"""
     .pill { font-size:.75rem; padding:.05rem .45rem; border:1px solid var(--border); border-radius:999px; color:#e2e8f0; background:rgba(255,255,255,.12); }
     .dark .pill { border-color: var(--border); color:#94a3b8; background:rgba(0,0,0,.25); }
 
-    /* Modal (big) */
+    /* Modal */
     .modal { display:none; position:fixed; inset:0; z-index:1000; background:var(--overlay); align-items:center; justify-content:center; padding:1rem; }
     .modal.show { display:flex; }
     .modal-box { background:var(--card-bg); color:var(--text); width:min(860px, 96vw); border-radius:10px; border:1px solid var(--border); box-shadow:0 15px 60px rgba(0,0,0,.25); max-height:90vh; display:flex; flex-direction:column; }
@@ -612,7 +694,7 @@ BASE = r"""
     {{ content|safe }}
   </div>
 
-  <!-- MODAL: Multi-purpose (Add/Edit/Manage/Import) -->
+  <!-- MODAL -->
   <div id="modal" class="modal" aria-hidden="true">
     <div class="modal-box">
       <div class="modal-head">
@@ -620,7 +702,7 @@ BASE = r"""
         <button class="xbtn" id="modalClose" title="Close"><i class="fa-solid fa-xmark"></i></button>
       </div>
       <div class="modal-body">
-        <!-- Bookmark form (ADD) -->
+        <!-- Bookmark ADD -->
         <form id="bookmarkForm" method="post" action="{{ url_for('add_bookmark') }}" style="display:none" enctype="multipart/form-data">
           <input type="hidden" name="widget_id" id="bm_widget_id">
           <label>Widget</label>
@@ -629,12 +711,10 @@ BASE = r"""
               <option value="{{ w['id'] }}"> {{ w['name'] }} (col {{ w['column'] }})</option>
             {% endfor %}
           </select>
-
           <label style="margin-top:.5rem;">Title (optional)</label>
           <input type="text" name="name" placeholder="Custom title">
           <label>URL</label>
           <input type="url" name="url" placeholder="https://example.com">
-
           <details style="margin-top:.7rem;">
             <summary style="cursor:pointer">Add multiple URLs</summary>
             <div style="margin-top:.4rem;">
@@ -648,7 +728,7 @@ BASE = r"""
           </details>
         </form>
 
-        <!-- Note form (ADD) -->
+        <!-- Note ADD -->
         <form id="noteForm" method="post" action="{{ url_for('add_note') }}" style="display:none">
           <input type="hidden" name="widget_id" id="note_widget_id">
           <label>Widget</label>
@@ -657,18 +737,16 @@ BASE = r"""
               <option value="{{ w['id'] }}"> {{ w['name'] }} (col {{ w['column'] }})</option>
             {% endfor %}
           </select>
-
           <label>Note</label>
           <textarea name="notes" rows="7" placeholder="Type your note..."></textarea>
           <label>Background color</label>
           <input type="color" name="color" value="#FEF3C7">
         </form>
 
-        <!-- Manage panel (actions + items list) -->
+        <!-- Manage (Actions + Items) -->
         <div id="managePanel" style="display:none">
           <p class="muted" id="manageWidgetName"></p>
 
-          <!-- Actions (hidden when showing Manage Items for a widget) -->
           <div id="actionsPanel">
             <div class="group">
               <div class="group-title"><i class="fa-solid fa-file-lines"></i> Page — add / edit / delete</div>
@@ -690,15 +768,22 @@ BASE = r"""
               <div class="group-title"><i class="fa-solid fa-file-import"></i> Import / tools</div>
               <ul class="manage-list">
                 <li><i class="fa-solid fa-file-import"></i> Import bookmarks (HTML)<div class="manage-actions"><button class="btn small" type="button" data-open="importForm"><i class="fa-solid fa-arrow-right"></i></button></div></li>
+                <li><i class="fa-solid fa-broom"></i> Dedupe (widgets & bookmarks)<div class="manage-actions"><button class="btn small" id="runDedupeBtn" type="button" title="Merge duplicate widgets and bookmarks"><i class="fa-solid fa-play"></i></button></div></li>
+                <li><i class="fa-solid fa-clone"></i> Show duplicate bookmarks<div class="manage-actions"><button class="btn small" type="button" data-open="dupesPanel"><i class="fa-solid fa-arrow-right"></i></button></div></li>
               </ul>
             </div>
           </div>
 
-          <!-- Manage items list (only visible for a specific widget) -->
           <ul class="manage-list" id="manageList" style="display:none"></ul>
         </div>
 
-        <!-- Edit Bookmark (modal) -->
+        <!-- Duplicate Bookmarks Panel -->
+        <div id="dupesPanel" style="display:none">
+          <p class="muted">Shows duplicate bookmarks across all widgets on the <strong>current page</strong>.</p>
+          <div id="dupesBox" class="group" style="max-height:60vh; overflow:auto;"></div>
+        </div>
+
+        <!-- Edit Bookmark -->
         <form id="editBookmarkForm" method="post" style="display:none">
           <input type="hidden" name="id" id="eb_id">
           <label>Title</label>
@@ -713,7 +798,7 @@ BASE = r"""
           </select>
         </form>
 
-        <!-- Edit Note (modal) -->
+        <!-- Edit Note -->
         <form id="editNoteForm" method="post" style="display:none">
           <input type="hidden" name="id" id="en_id">
           <label>Note</label>
@@ -866,7 +951,7 @@ BASE = r"""
   </div>
 
   <script>
-  // ---------- Theme toggle ----------
+  // Theme toggle
   (function() {
     const key = 'theme';
     const btn = document.getElementById('themeToggle');
@@ -889,7 +974,7 @@ BASE = r"""
     }
   })();
 
-  // ---------- Collapse/Expand All ----------
+  // Collapse/Expand All
   (function(){
     const btn = document.getElementById('toggleAll');
     let collapsedAll = localStorage.getItem('collapsedAll') === '1';
@@ -913,7 +998,7 @@ BASE = r"""
     }
   })();
 
-  // ---------- Search popover ----------
+  // Search popover
   (function(){
     const toggle = document.getElementById('searchToggle');
     const panel = document.getElementById('searchPanel');
@@ -932,30 +1017,13 @@ BASE = r"""
       panel.classList.remove('show');
       panel.setAttribute('aria-hidden','true');
     }
-    if(toggle){
-      toggle.addEventListener('click', (e)=>{ e.stopPropagation(); if(panel.classList.contains('show')) closePanel(); else openPanel(); });
-    }
+    if(toggle){ toggle.addEventListener('click', (e)=>{ e.stopPropagation(); if(panel.classList.contains('show')) closePanel(); else openPanel(); }); }
     if(closeBtn){ closeBtn.addEventListener('click', closePanel); }
-
-    document.addEventListener('click', (e)=>{
-      if(!panel.contains(e.target) && !toggle.contains(e.target)) closePanel();
-    });
-    document.addEventListener('keydown', (e)=>{
-      if(e.key === 'Escape') closePanel();
-      if(e.key === '/' && !e.target.closest('input,textarea')){
-        e.preventDefault(); openPanel();
-      }
-      if(e.key === 'Enter' && panel.classList.contains('show') && document.activeElement === input){
-        const first = results.querySelector('.sp-item a.btn');
-        if(first){ first.click(); }
-      }
-    });
+    document.addEventListener('click', (e)=>{ if(!panel.contains(e.target) && !toggle.contains(e.target)) closePanel(); });
+    document.addEventListener('keydown', (e)=>{ if(e.key === 'Escape') closePanel(); });
 
     let t = null, lastQ = '';
-    input.addEventListener('input', ()=>{
-      clearTimeout(t);
-      t = setTimeout(()=> doSearch(input.value), 120);
-    });
+    input.addEventListener('input', ()=>{ clearTimeout(t); t = setTimeout(()=> doSearch(input.value), 120); });
 
     function highlight(text, q){
       if(!q) return text;
@@ -1001,7 +1069,7 @@ BASE = r"""
     }
   })();
 
-  // ---------- Modal helpers (big modal) ----------
+  // Modal helpers
   const modal = document.getElementById('modal');
   const modalTitle = document.getElementById('modalTitle');
   const modalClose = document.getElementById('modalClose');
@@ -1010,7 +1078,7 @@ BASE = r"""
   const actionsPanel = document.getElementById('actionsPanel');
 
   function hideAllSections(){
-    document.querySelectorAll('#modal form, #managePanel').forEach(el => el.style.display='none');
+    document.querySelectorAll('#modal form, #managePanel, #dupesPanel').forEach(el => el.style.display='none');
   }
   function showModalWith(sectionId, title){
     hideAllSections();
@@ -1024,12 +1092,15 @@ BASE = r"""
       document.getElementById('managePanel').dataset.wid = '';
       modalFoot.style.display='none';
     }
+    if(sectionId==='dupesPanel'){
+      modalFoot.style.display='none';
+    }
     modalTitle.textContent = title || 'Form';
     modal.classList.add('show');
     modal.setAttribute('aria-hidden', 'false');
     modalSubmit.dataset.target = sectionId;
     if(el && el.tagName === 'FORM'){ modalFoot.style.display='flex'; }
-    else if(sectionId!=='managePanel'){ modalFoot.style.display='none'; }
+    else if(sectionId!=='managePanel' && sectionId!=='dupesPanel'){ modalFoot.style.display='none'; }
   }
   function hideModal(){
     modal.classList.remove('show');
@@ -1096,15 +1167,12 @@ BASE = r"""
     }
   });
 
-  // Manage button opens the ACTIONS view (not items)
   const manageButton = document.getElementById('manageButton');
-  if(manageButton){
-    manageButton.addEventListener('click', function(){
-      showModalWith('managePanel', 'Actions');
-    });
-  }
+  if(manageButton){ manageButton.addEventListener('click', ()=> showModalWith('managePanel', 'Actions')); }
 
-  // Manage panel: open subforms
+  // ====== DUPES state (NEW) ======
+  let DUPES = [];
+
   document.getElementById('managePanel').addEventListener('click', function(e){
     const btn = e.target.closest('[data-open]');
     if(btn){
@@ -1112,13 +1180,109 @@ BASE = r"""
       const titles = {
         addPageForm:'Add Page', renamePageForm:'Rename Page', removePageForm:'Remove Page',
         addWidgetForm:'Add Widget', renameWidgetForm:'Rename Widget', removeWidgetForm:'Remove Widget',
-        importForm:'Import Bookmarks (HTML)'
+        importForm:'Import Bookmarks (HTML)', dupesPanel:'Duplicate Bookmarks'
       };
       showModalWith(id, titles[id] || 'Action');
+      if(id==='dupesPanel'){
+        // load dupes and keep in-memory so deletes can update the list without closing modal
+        (async ()=>{
+          const box = document.getElementById('dupesBox');
+          box.innerHTML = '<div class="muted">Scanning…</div>';
+          try{
+            const rsp = await fetch('/api/dupes', {credentials:'same-origin'});
+            const data = await rsp.json();
+            DUPES = data.groups || [];
+            renderDupes(); // uses DUPES
+          }catch(e){
+            DUPES = [];
+            box.innerHTML = '<div class="muted">Failed to load duplicates.</div>';
+          }
+        })();
+      }
+    }
+    const dedupeBtn = e.target.closest('#runDedupeBtn');
+    if(dedupeBtn){
+      rememberModal('managePanel', 'Actions', null);
+      fetch('/dedupe', {method:'POST'}).then(()=>location.reload());
     }
   });
 
-  // Manage Items builder (shows only the item's list; hides actions)
+  function renderDupes(groups){
+    const box = document.getElementById('dupesBox');
+    if(!box) return;
+    const data = groups || DUPES;
+    if(!data || data.length === 0){
+      box.innerHTML = '<div class="muted">No duplicates found on this page 🎉</div>';
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    data.forEach(g => {
+      const wrap = document.createElement('div');
+      wrap.style.padding = '.4rem .2rem';
+      wrap.style.borderTop = '1px solid var(--border)';
+      const title = document.createElement('div');
+      title.style.fontWeight = '700';
+      title.style.margin = '.2rem 0 .35rem';
+      title.textContent = g.display + ':';
+      wrap.appendChild(title);
+
+      g.entries.forEach((e, idx) => {
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.alignItems = 'center';
+        row.style.gap = '.5rem';
+        row.style.padding = '0 .2rem .25rem 1.2rem';
+        row.innerHTML = `
+          <span class="muted" style="min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+            ${e.widget}
+          </span>
+          <button class="btn danger small" data-del-id="${e.id}" title="Delete this duplicate">
+            <i class="fa-solid fa-trash"></i>
+          </button>
+        `;
+        if(idx === 0){
+          const btn = row.querySelector('button');
+          if(btn){ btn.disabled = true; btn.classList.add('ghost'); btn.classList.remove('danger'); btn.title = 'Primary copy kept'; }
+        }
+        wrap.appendChild(row);
+      });
+      frag.appendChild(wrap);
+    });
+    box.innerHTML = '';
+    box.appendChild(frag);
+
+    // Handle delete WITHOUT closing the modal or full reload
+    box.onclick = async function(ev){
+      const btn = ev.target.closest('[data-del-id]');
+      if(!btn) return;
+      const id = btn.getAttribute('data-del-id');
+      btn.disabled = true;
+
+      try{
+        await fetch(`/items/${id}/delete`, {method:'POST', credentials:'same-origin'});
+        removeFromDupes(id);  // mutate DUPES
+        renderDupes();        // re-render from DUPES
+      }catch(e){
+        btn.disabled = false; // allow retry
+      }
+    };
+  }
+
+  function removeFromDupes(itemId){
+    for(let gi = 0; gi < DUPES.length; gi++){
+      const g = DUPES[gi];
+      const idx = g.entries.findIndex(e => e.id === itemId);
+      if(idx !== -1){
+        g.entries.splice(idx, 1);
+        if(g.entries.length < 2){
+          DUPES.splice(gi, 1); // no longer a duplicate group
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
   function buildManageListForWidget(widgetEl){
     const list = document.getElementById('manageList');
     const name = document.getElementById('manageWidgetName');
@@ -1126,6 +1290,7 @@ BASE = r"""
     const wname = widgetEl.querySelector('.widget-title')?.textContent || '';
     name.textContent = 'Widget: ' + wname;
     document.getElementById('managePanel').dataset.wid = wid;
+    const actionsPanel = document.getElementById('actionsPanel');
     if(actionsPanel) actionsPanel.style.display = 'none';
     list.innerHTML = '';
     list.style.display = '';
@@ -1172,7 +1337,7 @@ BASE = r"""
           enf.action = `/items/${iid}/edit`;
           document.getElementById('en_id').value = iid;
           document.getElementById('en_notes').value = txt;
-          if(color && color !== 'var(--hover)'){ document.getElementById('en_color').value = rgbToHex(color) || '#FEF3C7'; }
+          if(color && color !== 'var(--hover)'){ document.getElementById('en_color').value = '#FEF3C7'; }
           const wsel = document.getElementById('en_widget'); if (wsel) wsel.value = wid;
           showModalWith('editNoteForm', 'Edit Note');
         }
@@ -1185,7 +1350,7 @@ BASE = r"""
     };
   }
 
-  // Widget menu logic (includes move/copy)
+  // Widget menu
   document.addEventListener('click', function(e){
     const menuBtn = e.target.closest('.menu-btn');
     if(menuBtn){
@@ -1195,9 +1360,7 @@ BASE = r"""
       menu.classList.toggle('show');
       return;
     }
-    if(!e.target.closest('.dropdown')) {
-      document.querySelectorAll('.dropdown').forEach(d => d.classList.remove('show'));
-    }
+    if(!e.target.closest('.dropdown')) { document.querySelectorAll('.dropdown').forEach(d => d.classList.remove('show')); }
 
     const openModal = e.target.closest('[data-action="open-modal"]');
     if(openModal){
@@ -1223,8 +1386,8 @@ BASE = r"""
     if(manage){
       e.preventDefault();
       const widget = manage.closest('.widget');
-      showModalWith('managePanel', 'Manage Items');     // OPEN FIRST
-      buildManageListForWidget(widget);                 // THEN BUILD LIST (so actions don't reappear)
+      showModalWith('managePanel', 'Manage Items');
+      buildManageListForWidget(widget);
       const menu = manage.closest('.dropdown'); if(menu) menu.classList.remove('show');
     }
 
@@ -1234,10 +1397,8 @@ BASE = r"""
       const widget = rename.closest('.widget');
       const wid = widget.dataset.wid;
       const currentName = widget.querySelector('.widget-title')?.textContent || '';
-      const sel = document.getElementById('rnw_select');
-      if(sel){ sel.value = wid; }
-      const nm = document.getElementById('rnw_name');
-      if(nm){ nm.value = currentName; }
+      const sel = document.getElementById('rnw_select'); if(sel){ sel.value = wid; }
+      const nm = document.getElementById('rnw_name'); if(nm){ nm.value = currentName; }
       showModalWith('renameWidgetForm', 'Rename Widget');
       const menu = rename.closest('.dropdown'); if(menu) menu.classList.remove('show');
     }
@@ -1247,8 +1408,7 @@ BASE = r"""
       e.preventDefault();
       const widget = removeWidget.closest('.widget');
       const wid = widget.dataset.wid;
-      const fd = new FormData();
-      fd.append('widget_id', wid);
+      const fd = new FormData(); fd.append('widget_id', wid);
       fetch('{{ url_for("delete_widget") }}', {method:'POST', body: fd})
         .then(()=>location.reload());
       const menu = removeWidget.closest('.dropdown'); if(menu) menu.classList.remove('show');
@@ -1281,9 +1441,7 @@ BASE = r"""
       e.preventDefault();
       const widget = openAll.closest('.widget');
       const links = Array.from(widget.querySelectorAll('.item[data-type="bookmark"] a'));
-      for (let i = 0; i < links.length; i++) {
-        window.open(links[i].href, '_blank', 'noopener,noreferrer');
-      }
+      for (let i = 0; i < links.length; i++) { window.open(links[i].href, '_blank', 'noopener,noreferrer'); }
       const menu = openAll.closest('.dropdown'); if(menu) menu.classList.remove('show');
     }
 
@@ -1294,18 +1452,7 @@ BASE = r"""
     }
   });
 
-  function rgbToHex(rgb){
-    if(!rgb) return null;
-    if(rgb.startsWith('#')) return rgb;
-    const m = rgb.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-    if(!m) return null;
-    const r = (+m[1]).toString(16).padStart(2,'0');
-    const g = (+m[2]).toString(16).padStart(2,'0');
-    const b = (+m[3]).toString(16).padStart(2,'0');
-    return `#${r}${g}${b}`;
-  }
-
-  // ---------- Drag & drop ----------
+  // Drag & drop
   function sendReorder(){
     const widgets = [];
     document.querySelectorAll(".col").forEach((colDiv) => {
@@ -1331,23 +1478,10 @@ BASE = r"""
   }
 
   document.querySelectorAll(".col").forEach((col) => {
-    new Sortable(col, {
-      group: "widgets",
-      handle: ".drag-handle",
-      animation: 150,
-      draggable: ".widget",
-      onEnd: sendReorder
-    });
+    new Sortable(col, { group: "widgets", handle: ".drag-handle", animation: 150, draggable: ".widget", onEnd: sendReorder });
   });
-
   document.querySelectorAll(".items").forEach((list) => {
-    new Sortable(list, {
-      group: "items",
-      handle: ".grip",
-      animation: 150,
-      draggable: ".item",
-      onEnd: sendReorder
-    });
+    new Sortable(list, { group: "items", handle: ".grip", animation: 150, draggable: ".item", onEnd: sendReorder });
   });
   </script>
 </body>
@@ -1430,6 +1564,7 @@ def page(tpl, **ctx):
     ctx.setdefault("widgets_select", get_widgets_for_select(rows, current_page_id))
     return render_template_string(BASE, content=render_template_string(tpl, **ctx), **ctx)
 
+
 # ----------------------------
 # Routes
 # ----------------------------
@@ -1457,11 +1592,8 @@ def api_search():
         if q and (q not in name.lower()) and (q not in url.lower()):
             continue
         res.append({
-            "id": r["id"],
-            "name": name or url,
-            "url": url,
-            "widget_id": wid,
-            "widget": widget_map[wid],
+            "id": r["id"], "name": name or url, "url": url,
+            "widget_id": wid, "widget": widget_map[wid],
             "favicon": favicon_filter(url),
         })
     if q:
@@ -1472,6 +1604,15 @@ def api_search():
     else:
         res.sort(key=lambda x: x["name"].lower())
     return jsonify({"results": res[:200]})
+
+# dupes API
+@app.route("/api/dupes")
+@login_required
+def api_dupes():
+    rows = load_rows()
+    pid = get_current_page_id(rows)
+    groups = list_duplicate_bookmarks(rows, pid)
+    return jsonify({"groups": groups})
 
 @app.route("/switch_page", methods=["POST"])
 def switch_page():
@@ -1545,9 +1686,11 @@ def add_widget():
     wid = new_id()
     rows.append(dict(rowtype="widget", id=wid, page_id=page_id, widget_id="", column=str(column),
                      order=str(next_widget_order(rows, page_id, column)), name=name, url="", notes="", color=""))
+    wr, br = run_dedupe(rows)
     save_rows(rows)
+    if wr or br: flash(f"Dedupe: merged {wr} widget(s), removed {br} duplicate bookmark(s).", "info")
+    else: flash("Widget added.", "success")
     session["page_id"] = page_id
-    flash("Widget added.", "success")
     return redirect(url_for("index"))
 
 # ---- Remove: Pages & Widgets ----
@@ -1597,7 +1740,9 @@ def rename_widget():
     r = find_row(rows, wid)
     if r and r.get("rowtype")=="widget" and name:
         r["name"] = name
+        wr, br = run_dedupe(rows)
         save_rows(rows)
+        if wr or br: flash(f"Dedupe: merged {wr} widget(s), removed {br} duplicate bookmark(s).", "info")
     return redirect(url_for("index"))
 
 # ---- Move/Copy widget ----
@@ -1609,15 +1754,14 @@ def move_widget():
     target_page = request.form.get("page_id","")
     target_col = int(request.form.get("column","1"))
     w = find_row(rows, wid)
-    if not w or w.get("rowtype")!="widget":
-        return redirect(url_for("index"))
-    if not any(r.get("rowtype")=="page" and r.get("id")==target_page for r in rows):
-        return redirect(url_for("index"))
+    if not w or w.get("rowtype")!="widget": return redirect(url_for("index"))
+    if not any(r.get("rowtype")=="page" and r.get("id")==target_page for r in rows): return redirect(url_for("index"))
     w["page_id"] = target_page
     w["column"] = str(max(1,min(6,target_col)))
     w["order"] = str(next_widget_order(rows, target_page, int(w["column"])))
+    wr, br = run_dedupe(rows)
     save_rows(rows)
-    flash("Widget moved.", "success")
+    flash(f"Widget moved. Dedupe merged {wr} widget(s), removed {br} duplicate bookmark(s).", "success")
     return redirect(url_for("index"))
 
 @app.route("/widgets/copy", methods=["POST"])
@@ -1628,21 +1772,17 @@ def copy_widget():
     target_page = request.form.get("page_id","")
     target_col = int(request.form.get("column","1"))
     w = find_row(rows, wid)
-    if not w or w.get("rowtype")!="widget":
-        return redirect(url_for("index"))
-    if not any(r.get("rowtype")=="page" and r.get("id")==target_page for r in rows):
-        return redirect(url_for("index"))
+    if not w or w.get("rowtype")!="widget": return redirect(url_for("index"))
+    if not any(r.get("rowtype")=="page" and r.get("id")==target_page for r in rows): return redirect(url_for("index"))
     new_wid = new_id()
     rows.append(dict(rowtype="widget", id=new_wid, page_id=target_page, widget_id="", column=str(max(1,min(6,target_col))),
                      order=str(next_widget_order(rows, target_page, max(1,min(6,target_col)))), name=w.get("name",""), url="", notes="", color=""))
     for r in rows[:]:
         if r.get("rowtype") in ("bookmark","note") and r.get("widget_id")==wid:
-            nr = r.copy()
-            nr["id"] = new_id()
-            nr["widget_id"] = new_wid
-            rows.append(nr)
+            nr = r.copy(); nr["id"] = new_id(); nr["widget_id"] = new_wid; rows.append(nr)
+    wr, br = run_dedupe(rows)
     save_rows(rows)
-    flash("Widget copied.", "success")
+    flash(f"Widget copied. Dedupe merged {wr} widget(s), removed {br} duplicate bookmark(s).", "success")
     return redirect(url_for("index"))
 
 # ---- Items: add/edit/delete ----
@@ -1657,6 +1797,7 @@ def add_bookmark():
     single_url = (request.form.get("url") or "").strip()
     single_name = (request.form.get("name") or "").strip()
     created = 0
+
     def add_single(url, name_override="", auto=True):
         nonlocal created
         url = normalize_url(url)
@@ -1678,8 +1819,10 @@ def add_bookmark():
             add_single(u, "", auto=auto_titles)
 
     if created:
+        br = dedupe_bookmarks(rows)
         save_rows(rows)
-        flash(f"Added {created} bookmark(s).", "success")
+        if br: flash(f"Added {created} bookmark(s). Removed {br} duplicate(s).", "success")
+        else: flash(f"Added {created} bookmark(s).", "success")
     else:
         flash("No valid URLs provided.", "danger")
     return redirect(url_for("index"))
@@ -1711,6 +1854,7 @@ def edit_item(iid):
     if r["rowtype"]=="bookmark":
         r["name"] = request.form.get("name", r.get("name",""))
         r["url"]  = request.form.get("url", r.get("url",""))
+        _ = dedupe_bookmarks(rows)
     else:
         r["notes"] = request.form.get("notes", r.get("notes",""))
         r["color"] = request.form.get("color", r.get("color",""))
@@ -1745,9 +1889,10 @@ def import_html():
     created_pages, created_widgets, created_bookmarks, pid_used, title_from_file = import_bookmarks_html(
         data, rows, page_id, new_page_name, column_start
     )
+    wr, br = run_dedupe(rows)
     save_rows(rows)
     session["page_id"] = pid_used
-    flash(f"Imported {created_widgets} widget(s) and {created_bookmarks} bookmark(s).", "success")
+    flash(f"Imported {created_widgets} widget(s), {created_bookmarks} bookmark(s). Dedupe merged {wr} widget(s), removed {br} duplicate bookmark(s).", "success")
     return redirect(url_for("index"))
 
 # ---- Drag & drop reorder ----
@@ -1772,13 +1917,24 @@ def reorder():
     save_rows(rows)
     return jsonify({"status":"ok"})
 
+# ---- Manual dedupe trigger ----
+@app.route("/dedupe", methods=["POST"])
+@login_required
+def dedupe_route():
+    rows = load_rows()
+    wr, br = run_dedupe(rows)
+    save_rows(rows)
+    flash(f"Dedupe complete: merged {wr} widget(s), removed {br} duplicate bookmark(s).", "success")
+    return redirect(url_for("index"))
+
+
 # ----------------------------
 # CLI tool
 # ----------------------------
 def cli_main(argv):
     ensure_csv()
     import argparse
-    parser = argparse.ArgumentParser(description="Manage Start Page CSV / import bookmarks")
+    parser = argparse.ArgumentParser(description="Manage Start Page CSV / import bookmarks / dedupe")
     sub = parser.add_subparsers(dest="cmd")
 
     sub.add_parser("list-pages", help="List pages")
@@ -1822,6 +1978,8 @@ def cli_main(argv):
     pid.add_argument("--new-page", help="New page name (if creating)")
     imp.add_argument("--column-start", type=int, default=1)
 
+    sub.add_parser("dedupe", help="Run widget + bookmark dedupe")
+
     args = parser.parse_args(argv)
     rows = load_rows()
 
@@ -1845,8 +2003,9 @@ def cli_main(argv):
         wid = new_id()
         rows.append(dict(rowtype="widget", id=wid, page_id=page_id, widget_id="", column=str(max(1,min(6,args.column))),
                          order=str(next_widget_order(rows, page_id, max(1,min(6,args.column)))), name=args.name, url="", notes="", color=""))
+        wr, br = run_dedupe(rows)
         save_rows(rows)
-        print(wid)
+        print(f"widget={wid} dedupe_widgets={wr} dedupe_bookmarks={br}")
         return 0
 
     if args.cmd == "rename-page":
@@ -1862,16 +2021,18 @@ def cli_main(argv):
         if not r or r.get("rowtype")!="widget":
             print("Widget not found", file=sys.stderr); return 1
         r["name"] = args.name
+        wr, br = run_dedupe(rows)
         save_rows(rows)
+        print(f"dedupe_widgets={wr} dedupe_bookmarks={br}")
         return 0
 
     if args.cmd == "delete-widget":
         wid = args.id
         rows2 = []
         for r in rows:
-            if r.get("rowtype")=="widget" and r.get("id")==wid: continue
-            if r.get("rowtype") in ("bookmark","note") and r.get("widget_id")==wid: continue
-            rows2.append(r)
+          if r.get("rowtype")=="widget" and r.get("id")==wid: continue
+          if r.get("rowtype") in ("bookmark","note") and r.get("widget_id")==wid: continue
+          rows2.append(r)
         save_rows(rows2)
         return 0
 
@@ -1880,10 +2041,12 @@ def cli_main(argv):
         if not any(r.get("rowtype")=="widget" and r.get("id")==wid for r in rows):
             print("Widget not found", file=sys.stderr); return 1
         url = normalize_url(args.url)
-        name = args.name.strip() or guess_title_from_url(url)
+        name = (args.name or "").strip() or guess_title_from_url(url)
         rows.append(dict(rowtype="bookmark", id=new_id(), page_id="", widget_id=wid, column="",
                          order=str(next_item_order(rows, wid)), name=name, url=url, notes="", color=""))
+        br = dedupe_bookmarks(rows)
         save_rows(rows)
+        print(f"dedupe_bookmarks={br}")
         return 0
 
     if args.cmd == "add-note":
@@ -1911,12 +2074,20 @@ def cli_main(argv):
         created_pages, created_widgets, created_bookmarks, pid_used, title = import_bookmarks_html(
             data, rows, args.page or None, (args.new_page or None), args.column_start
         )
+        wr, br = run_dedupe(rows)
         save_rows(rows)
-        print(f"Imported page={pid_used} widgets={created_widgets} bookmarks={created_bookmarks}")
+        print(f"Imported page={pid_used} widgets={created_widgets} bookmarks={created_bookmarks} | dedupe_widgets={wr} dedupe_bookmarks={br}")
+        return 0
+
+    if args.cmd == "dedupe":
+        wr, br = run_dedupe(rows)
+        save_rows(rows)
+        print(f"dedupe_widgets={wr} dedupe_bookmarks={br}")
         return 0
 
     parser.print_help()
     return 0
+
 
 # ------------- Run -------------
 if __name__ == "__main__":
@@ -1935,6 +2106,6 @@ if __name__ == "__main__":
             dict(rowtype="bookmark", id=new_id(), page_id="", widget_id=wid_dev,  column="", order="0", name="GitHub",       url="https://github.com", notes="", color=""),
             dict(rowtype="note",     id=new_id(), page_id="", widget_id=wid_news, column="", order="1", name="", url="", notes="Sticky notes go here.", color="#FEF3C7")
         ])
+        run_dedupe(rows)
         save_rows(rows)
     app.run(debug=True, host="127.0.0.1", port=5000)
-
