@@ -6,8 +6,8 @@
 # - Import Chrome/Firefox bookmarks.html (folders → widgets)
 # - Dedupe (widgets by name per page; bookmarks by canonical URL per widget)
 # - Manage panel + search popover
-# - "Duplicate Bookmarks" viewer under Manage → Import / tools
-# - Keeps the "Duplicate Bookmarks" modal open while deleting entries (no full reload)
+# - "Duplicate Bookmarks" viewer that stays open while deleting entries
+# - **FIX**: Editing a bookmark now uses JSON (AJAX) responses to avoid gunicorn 30s timeouts
 #
 # Auth: simple session login (admin/password by default — override via env)
 # Storage: bookmarks.csv (no DB). CLI helpers included at bottom.
@@ -15,7 +15,10 @@
 import csv, os, re, html, sys, uuid
 from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
-from flask import Flask, request, redirect, url_for, session, flash, render_template_string, jsonify
+from flask import (
+    Flask, request, redirect, url_for, session, flash,
+    render_template_string, jsonify
+)
 from markupsafe import Markup, escape
 from html.parser import HTMLParser
 
@@ -1147,33 +1150,11 @@ BASE = r"""
     }
   });
 
-  modalSubmit.addEventListener('click', async function(){
-    const id = modalSubmit.dataset.target || '';
-    const el = document.getElementById(id);
-    if(!el) return;
-    if(el.tagName === 'FORM') {
-      const fd = new FormData(el);
-      const action = el.getAttribute('action') || window.location.pathname;
-      const method = (el.getAttribute('method') || 'POST').toUpperCase();
-      if(id==='editBookmarkForm' || id==='editNoteForm'){
-        rememberModal('managePanel', 'Manage Items', getWidForSection(id));
-      } else if(id==='moveWidgetForm' || id==='copyWidgetForm'){
-        rememberModal('managePanel', 'Actions', null);
-      } else {
-        rememberModal(id, document.getElementById('modalTitle').textContent, getWidForSection(id));
-      }
-      try{ await fetch(action, {method, body: fd, credentials:'same-origin'}); }catch(e){}
-      location.reload();
-    }
-  });
-
-  const manageButton = document.getElementById('manageButton');
-  if(manageButton){ manageButton.addEventListener('click', ()=> showModalWith('managePanel', 'Actions')); }
-
-  // ====== DUPES state (NEW) ======
+  // ====== DUPES state (keeps modal open) ======
   let DUPES = [];
 
-  document.getElementById('managePanel').addEventListener('click', function(e){
+  const managePanelEl = document.getElementById('managePanel');
+  managePanelEl.addEventListener('click', function(e){
     const btn = e.target.closest('[data-open]');
     if(btn){
       const id = btn.getAttribute('data-open');
@@ -1184,7 +1165,6 @@ BASE = r"""
       };
       showModalWith(id, titles[id] || 'Action');
       if(id==='dupesPanel'){
-        // load dupes and keep in-memory so deletes can update the list without closing modal
         (async ()=>{
           const box = document.getElementById('dupesBox');
           box.innerHTML = '<div class="muted">Scanning…</div>';
@@ -1192,7 +1172,7 @@ BASE = r"""
             const rsp = await fetch('/api/dupes', {credentials:'same-origin'});
             const data = await rsp.json();
             DUPES = data.groups || [];
-            renderDupes(); // uses DUPES
+            renderDupes();
           }catch(e){
             DUPES = [];
             box.innerHTML = '<div class="muted">Failed to load duplicates.</div>';
@@ -1236,14 +1216,10 @@ BASE = r"""
           <span class="muted" style="min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
             ${e.widget}
           </span>
-          <button class="btn danger small" data-del-id="${e.id}" title="Delete this duplicate">
+          <button class="btn ${idx===0?'ghost':'danger'} small" ${idx===0?'disabled':''} data-del-id="${e.id}" title="${idx===0?'Primary copy kept':'Delete this duplicate'}">
             <i class="fa-solid fa-trash"></i>
           </button>
         `;
-        if(idx === 0){
-          const btn = row.querySelector('button');
-          if(btn){ btn.disabled = true; btn.classList.add('ghost'); btn.classList.remove('danger'); btn.title = 'Primary copy kept'; }
-        }
         wrap.appendChild(row);
       });
       frag.appendChild(wrap);
@@ -1251,19 +1227,18 @@ BASE = r"""
     box.innerHTML = '';
     box.appendChild(frag);
 
-    // Handle delete WITHOUT closing the modal or full reload
     box.onclick = async function(ev){
       const btn = ev.target.closest('[data-del-id]');
-      if(!btn) return;
+      if(!btn || btn.disabled) return;
       const id = btn.getAttribute('data-del-id');
       btn.disabled = true;
 
       try{
-        await fetch(`/items/${id}/delete`, {method:'POST', credentials:'same-origin'});
-        removeFromDupes(id);  // mutate DUPES
-        renderDupes();        // re-render from DUPES
+        await fetch(`/items/${id}/delete`, {method:'POST', credentials:'same-origin', headers:{'Accept':'application/json','X-Requested-With':'fetch'}});
+        removeFromDupes(id);
+        renderDupes();
       }catch(e){
-        btn.disabled = false; // allow retry
+        btn.disabled = false;
       }
     };
   }
@@ -1275,7 +1250,7 @@ BASE = r"""
       if(idx !== -1){
         g.entries.splice(idx, 1);
         if(g.entries.length < 2){
-          DUPES.splice(gi, 1); // no longer a duplicate group
+          DUPES.splice(gi, 1);
         }
         return true;
       }
@@ -1287,7 +1262,7 @@ BASE = r"""
     const list = document.getElementById('manageList');
     const name = document.getElementById('manageWidgetName');
     const wid = widgetEl.dataset.wid;
-    const wname = widgetEl.querySelector('.widget-title')?.textContent || '';
+    const wname = widgetEl.querySelector('.widget-title')?.childNodes[0]?.textContent?.trim() || widgetEl.querySelector('.widget-title')?.textContent || '';
     name.textContent = 'Widget: ' + wname;
     document.getElementById('managePanel').dataset.wid = wid;
     const actionsPanel = document.getElementById('actionsPanel');
@@ -1311,7 +1286,7 @@ BASE = r"""
       list.appendChild(li);
     });
 
-    list.onclick = function(e){
+    list.onclick = async function(e){
       const eb = e.target.closest('[data-edit]');
       const db = e.target.closest('[data-del]');
       if(eb){
@@ -1332,12 +1307,12 @@ BASE = r"""
         } else {
           const item = widgetEl.querySelector(`.item[data-iid="${iid}"]`);
           const txt = item.querySelector('.note')?.textContent || '';
-          const color = item.querySelector('.note')?.style.background || '';
+          const color = item.querySelector('.note')?.style.backgroundColor || '';
           const enf = document.getElementById('editNoteForm');
           enf.action = `/items/${iid}/edit`;
           document.getElementById('en_id').value = iid;
           document.getElementById('en_notes').value = txt;
-          if(color && color !== 'var(--hover)'){ document.getElementById('en_color').value = '#FEF3C7'; }
+          if(color){ document.getElementById('en_color').value = '#FEF3C7'; } // simple fallback
           const wsel = document.getElementById('en_widget'); if (wsel) wsel.value = wid;
           showModalWith('editNoteForm', 'Edit Note');
         }
@@ -1345,7 +1320,11 @@ BASE = r"""
       if(db){
         const iid = db.getAttribute('data-del');
         rememberModal('managePanel', 'Manage Items', wid);
-        fetch(`/items/${iid}/delete`, {method:'POST'}).then(()=>location.reload());
+        await fetch(`/items/${iid}/delete`, {method:'POST', headers:{'Accept':'application/json','X-Requested-With':'fetch'}});
+        // remove from DOM list immediately
+        const row = widgetEl.querySelector(`.item[data-iid="${iid}"]`);
+        if(row) row.remove();
+        buildManageListForWidget(widgetEl);
       }
     };
   }
@@ -1396,7 +1375,7 @@ BASE = r"""
       e.preventDefault();
       const widget = rename.closest('.widget');
       const wid = widget.dataset.wid;
-      const currentName = widget.querySelector('.widget-title')?.textContent || '';
+      const currentName = widget.querySelector('.widget-title')?.childNodes[0]?.textContent?.trim() || widget.querySelector('.widget-title')?.textContent || '';
       const sel = document.getElementById('rnw_select'); if(sel){ sel.value = wid; }
       const nm = document.getElementById('rnw_name'); if(nm){ nm.value = currentName; }
       showModalWith('renameWidgetForm', 'Rename Widget');
@@ -1451,6 +1430,157 @@ BASE = r"""
       widget.classList.toggle('collapsed');
     }
   });
+
+  // Modal submit (AJAX). For edit routes, we use JSON to avoid long redirects/timeouts under gunicorn.
+  modalSubmit.addEventListener('click', async function(){
+    const id = modalSubmit.dataset.target || '';
+    const el = document.getElementById(id);
+    if(!el) return;
+    if(el.tagName !== 'FORM') return;
+
+    const fd = new FormData(el);
+    const action = el.getAttribute('action') || window.location.pathname;
+    const method = (el.getAttribute('method') || 'POST').toUpperCase();
+
+    // If it's one of the inline edit forms, do JSON and update the DOM without a full reload.
+    if(id === 'editBookmarkForm' || id === 'editNoteForm'){
+      try{
+        const rsp = await fetch(action, {
+          method,
+          body: fd,
+          credentials: 'same-origin',
+          headers: {'Accept':'application/json','X-Requested-With':'fetch'}
+        });
+        const data = await rsp.json();
+
+        if(data.ok){
+          const wid = data.item.widget_id;
+          const iid = data.item.id;
+          // Update DOM minimally
+          if(data.item.rowtype === 'bookmark'){
+            // If widget changed, move element
+            let elItem = document.querySelector(`.item[data-iid="${iid}"]`);
+            if(!elItem){
+              // if not found (e.g., moved widgets), just reload
+              location.reload();
+              return;
+            }
+            const currentWid = elItem.closest('.items')?.dataset.wid;
+            if(currentWid !== wid){
+              const targetList = document.querySelector(`.items[data-wid="${wid}"]`);
+              if(targetList){ targetList.appendChild(elItem); }
+            }
+            // Update anchor
+            const a = elItem.querySelector('.label a');
+            if(a){
+              a.textContent = data.item.name;
+              a.href = data.item.url;
+            }
+          } else {
+            // note
+            let elItem = document.querySelector(`.item[data-iid="${iid}"]`);
+            if(!elItem){ location.reload(); return; }
+            const currentWid = elItem.closest('.items')?.dataset.wid;
+            if(currentWid !== wid){
+              const targetList = document.querySelector(`.items[data-wid="${wid}"]`);
+              if(targetList){ targetList.appendChild(elItem); }
+            }
+            const note = elItem.querySelector('.note');
+            if(note){
+              note.textContent = data.item.notes || '';
+              if(data.item.color){ note.style.background = data.item.color; }
+            }
+          }
+          // Return to Manage Items list (keep modal open)
+          const widget = document.querySelector(`.widget[data-wid="${getWidForSection('managePanel')||wid}"]`);
+          if(widget){ buildManageListForWidget(widget); showModalWith('managePanel','Manage Items'); }
+        } else {
+          // fallback
+          location.reload();
+        }
+      }catch(e){
+        location.reload();
+      }
+      return;
+    }
+
+    // For all other forms, keep the "reopen" behavior via localStorage and reload.
+    rememberModal(id, document.getElementById('modalTitle').textContent, getWidForSection(id));
+    try{ await fetch(action, {method, body: fd, credentials:'same-origin'}); }catch(e){}
+    location.reload();
+  });
+
+  const manageButton = document.getElementById('manageButton');
+  if(manageButton){ manageButton.addEventListener('click', ()=> showModalWith('managePanel', 'Actions')); }
+
+  function buildManageListForWidget(widgetEl){
+    const list = document.getElementById('manageList');
+    const name = document.getElementById('manageWidgetName');
+    const wid = widgetEl.dataset.wid;
+    const wname = widgetEl.querySelector('.widget-title')?.childNodes[0]?.textContent?.trim() || widgetEl.querySelector('.widget-title')?.textContent || '';
+    name.textContent = 'Widget: ' + wname;
+    document.getElementById('managePanel').dataset.wid = wid;
+    const actionsPanel = document.getElementById('actionsPanel');
+    if(actionsPanel) actionsPanel.style.display = 'none';
+    list.innerHTML = '';
+    list.style.display = '';
+    widgetEl.querySelectorAll('.items .item').forEach(it => {
+      const iid = it.dataset.iid;
+      const type = it.dataset.type;
+      let title = '';
+      if(type === 'bookmark'){ title = (it.querySelector('.label a')?.textContent || '').trim(); }
+      else { title = (it.querySelector('.note')?.textContent || '').trim().slice(0,80); }
+      const li = document.createElement('li');
+      li.innerHTML = `
+        <span class="pill">${type}</span>
+        <span style="max-width:55%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${title || '(untitled)'}</span>
+        <div class="manage-actions">
+          <button class="btn ghost small" type="button" data-edit="${iid}" data-type="${type}"><i class="fas fa-edit"></i></button>
+          <button class="btn danger small" type="button" data-del="${iid}"><i class="fa-solid fa-trash"></i></button>
+        </div>`;
+      list.appendChild(li);
+    });
+
+    list.onclick = async function(e){
+      const eb = e.target.closest('[data-edit]');
+      const db = e.target.closest('[data-del]');
+      if(eb){
+        const iid = eb.getAttribute('data-edit');
+        const type = eb.getAttribute('data-type');
+        if(type === 'bookmark'){
+          const item = widgetEl.querySelector(`.item[data-iid="${iid}"]`);
+          const a = item.querySelector('.label a');
+          const nameVal = a?.textContent?.trim() || '';
+          const urlVal = a?.getAttribute('href') || '';
+          const ebf = document.getElementById('editBookmarkForm');
+          ebf.action = `/items/${iid}/edit`;
+          document.getElementById('eb_id').value = iid;
+          document.getElementById('eb_name').value = nameVal;
+          document.getElementById('eb_url').value = urlVal;
+          const wsel = document.getElementById('eb_widget'); if (wsel) wsel.value = wid;
+          showModalWith('editBookmarkForm', 'Edit Bookmark');
+        } else {
+          const item = widgetEl.querySelector(`.item[data-iid="${iid}"]`);
+          const txt = item.querySelector('.note')?.textContent || '';
+          const color = item.querySelector('.note')?.style.backgroundColor || '';
+          const enf = document.getElementById('editNoteForm');
+          enf.action = `/items/${iid}/edit`;
+          document.getElementById('en_id').value = iid;
+          document.getElementById('en_notes').value = txt;
+          if(color){ document.getElementById('en_color').value = '#FEF3C7'; }
+          const wsel = document.getElementById('en_widget'); if (wsel) wsel.value = wid;
+          showModalWith('editNoteForm', 'Edit Note');
+        }
+      }
+      if(db){
+        const iid = db.getAttribute('data-del');
+        await fetch(`/items/${iid}/delete`, {method:'POST', headers:{'Accept':'application/json','X-Requested-With':'fetch'}});
+        const row = widgetEl.querySelector(`.item[data-iid="${iid}"]`);
+        if(row) row.remove();
+        buildManageListForWidget(widgetEl);
+      }
+    };
+  }
 
   // Drag & drop
   function sendReorder(){
@@ -1728,6 +1858,9 @@ def delete_widget():
         if r.get("rowtype") in ("bookmark","note") and r.get("widget_id")==wid: continue
         rows2.append(r)
     save_rows(rows2)
+    # JSON for AJAX delete via widget menu
+    if request.headers.get('Accept','').find('application/json') >= 0 or request.headers.get('X-Requested-With'):
+        return jsonify({"ok": True})
     return redirect(url_for("index"))
 
 # ---- Rename widget ----
@@ -1847,10 +1980,18 @@ def add_note():
 @app.route("/items/<iid>/edit", methods=["POST"])
 @login_required
 def edit_item(iid):
+    """
+    JSON-aware edit to prevent long redirect chains under gunicorn:
+    - If 'Accept: application/json' or 'X-Requested-With' is set, return JSON {ok:True,item:{...}}
+    - Else, redirect back to index (legacy behavior)
+    """
     rows = load_rows()
     r = find_row(rows, iid)
     if not r or r.get("rowtype") not in ("bookmark","note"):
+        if request.headers.get('Accept','').find('application/json') >= 0 or request.headers.get('X-Requested-With'):
+            return jsonify({"ok": False, "error": "not_found"}), 404
         return redirect(url_for("index"))
+
     if r["rowtype"]=="bookmark":
         r["name"] = request.form.get("name", r.get("name",""))
         r["url"]  = request.form.get("url", r.get("url",""))
@@ -1858,11 +1999,22 @@ def edit_item(iid):
     else:
         r["notes"] = request.form.get("notes", r.get("notes",""))
         r["color"] = request.form.get("color", r.get("color",""))
+
     new_wid = request.form.get("widget_id", r.get("widget_id"))
     if new_wid and new_wid != r.get("widget_id"):
         r["widget_id"] = new_wid
         r["order"] = str(next_item_order(rows, new_wid))
+
     save_rows(rows)
+
+    # JSON fast-path for AJAX
+    if request.headers.get('Accept','').find('application/json') >= 0 or request.headers.get('X-Requested-With'):
+        if r["rowtype"]=="bookmark":
+            payload = {"id": r["id"], "rowtype":"bookmark", "name": r.get("name",""), "url": r.get("url",""), "widget_id": r.get("widget_id")}
+        else:
+            payload = {"id": r["id"], "rowtype":"note", "notes": r.get("notes",""), "color": r.get("color",""), "widget_id": r.get("widget_id")}
+        return jsonify({"ok": True, "item": payload})
+
     return redirect(url_for("index"))
 
 @app.route("/items/<iid>/delete", methods=["POST"])
@@ -1872,6 +2024,8 @@ def delete_item(iid):
     rows2 = [r for r in rows if r.get("id") != iid]
     if len(rows2) != len(rows):
         save_rows(rows2)
+    if request.headers.get('Accept','').find('application/json') >= 0 or request.headers.get('X-Requested-With'):
+        return jsonify({"ok": True})
     return redirect(url_for("index"))
 
 # ---- Import HTML route ----
